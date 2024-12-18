@@ -1,0 +1,103 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda con DynamoDB utilizando el rol LabRole con permisos existentes
+
+Resources:
+  # DynamoDB Table
+  WeatherTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: WeatherTable
+      AttributeDefinitions:
+        - AttributeName: city
+          AttributeType: S
+        - AttributeName: date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: city
+          KeyType: HASH
+        - AttributeName: date
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST  # Coste bajo: pago por solicitud
+
+  # Lambda Function usando el rol existente
+  WeatherFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: WeatherFunction
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 10
+      MemorySize: 128  # Configuración mínima para costes bajos
+      Role: arn:aws:iam::851725361593:role/LabRole  # Rol existente
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import requests
+          from datetime import datetime
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('WeatherTable')
+
+          API_URL = "http://api.openweathermap.org/data/2.5/weather"
+          API_KEY = "tu_api_key"  # Reemplaza con tu clave API
+          CITY = "Madrid"
+
+          def fetch_weather_data():
+              params = {"q": CITY, "appid": API_KEY, "units": "metric"}
+              response = requests.get(API_URL, params=params)
+              response.raise_for_status()
+              data = response.json()
+              return {
+                  "city": CITY,
+                  "date": datetime.utcnow().strftime("%Y-%m-%d"),
+                  "timestamp": datetime.utcnow().isoformat(),
+                  "temperature": data["main"]["temp"],
+                  "weather": data["weather"][0]["description"],
+                  "humidity": data["main"]["humidity"],
+                  "wind_speed": data["wind"]["speed"]
+              }
+
+          def lambda_handler(event, context):
+              today = datetime.utcnow().strftime("%Y-%m-%d")
+              try:
+                  # Verificar si ya existen datos para hoy
+                  response = table.get_item(Key={"city": CITY, "date": today})
+                  if "Item" in response:
+                      return {"statusCode": 200, "body": "Datos ya existen."}
+                  
+                  # Obtener y guardar el clima actual
+                  weather_data = fetch_weather_data()
+                  table.put_item(Item=weather_data)
+                  return {"statusCode": 200, "body": json.dumps(weather_data)}
+              except Exception as e:
+                  return {"statusCode": 500, "body": str(e)}
+
+  # EventBridge Rule para ejecutar la Lambda diariamente
+  WeatherFunctionEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: WeatherDailyTrigger
+      ScheduleExpression: cron(0 12 * * ? *)  # Ejecutar diariamente a las 12:00 UTC
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt WeatherFunction.Arn
+          Id: WeatherFunctionTarget
+
+  # Permiso para que EventBridge invoque Lambda
+  WeatherFunctionEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt WeatherFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WeatherFunctionEventRule.Arn
+
+Outputs:
+  LambdaFunctionName:
+    Description: Nombre de la función Lambda
+    Value: !Ref WeatherFunction
+
+  DynamoDBTableName:
+    Description: Nombre de la tabla DynamoDB
+    Value: !Ref WeatherTable

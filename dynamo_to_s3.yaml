@@ -1,0 +1,113 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda que recoge datos de DynamoDB y los agrega a un CSV en S3 diariamente
+
+Resources:
+  # Crear un Bucket S3 con nombre fijo
+  WeatherDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: weatherjie2024  # Nombre fijo para el bucket
+      AccessControl: Private
+
+  # Crear la función Lambda
+  DynamoDBToS3Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DynamoDBToS3Lambda
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 15
+      MemorySize: 128
+      Role: arn:aws:iam::851725361593:role/LabRole  # Rol existente
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: WeatherTable
+          BUCKET_NAME: weatherjie2024  # Referencia al bucket con nombre fijo
+          CSV_FILE: weather_data.csv
+      Code:
+        ZipFile: |
+          import boto3
+          import csv
+          import json
+          from datetime import datetime
+
+          DYNAMODB_TABLE = "WeatherTable"
+          BUCKET_NAME = "weatherjie2024"  # Nombre del bucket
+          CSV_FILE = "weather_data.csv"
+
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+
+          def fetch_weather_data():
+              table = dynamodb.Table(DYNAMODB_TABLE)
+              response = table.scan()
+              return response.get('Items', [])
+
+          def append_to_csv(data):
+              s3_file = "/tmp/" + CSV_FILE
+              
+              # Descargar archivo CSV existente
+              try:
+                  s3.download_file(BUCKET_NAME, CSV_FILE, s3_file)
+              except:
+                  # Si no existe, crear uno nuevo
+                  with open(s3_file, mode='w', newline='', encoding='utf-8') as file:
+                      writer = csv.writer(file)
+                      writer.writerow(["city", "timestamp", "temperature", "weather", "humidity", "wind_speed"])
+
+              # Añadir nuevos datos
+              with open(s3_file, mode='a', newline='', encoding='utf-8') as file:
+                  writer = csv.writer(file)
+                  for item in data:
+                      writer.writerow([
+                          item.get("city"),
+                          item.get("timestamp"),
+                          item.get("temperature"),
+                          item.get("weather"),
+                          item.get("humidity"),
+                          item.get("wind_speed")
+                      ])
+
+              # Subir de nuevo a S3
+              s3.upload_file(s3_file, BUCKET_NAME, CSV_FILE)
+              print(f"Datos añadidos a {CSV_FILE} en S3.")
+
+          def lambda_handler(event, context):
+              try:
+                  weather_data = fetch_weather_data()
+                  if not weather_data:
+                      return {"statusCode": 200, "body": "No hay datos nuevos en DynamoDB."}
+
+                  append_to_csv(weather_data)
+                  return {"statusCode": 200, "body": "Datos agregados exitosamente al archivo CSV en S3."}
+              except Exception as e:
+                  return {"statusCode": 500, "body": str(e)}
+
+  # Configurar la regla de EventBridge para ejecutar Lambda a las 19:00 UTC
+  DynamoDBToS3EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: DynamoDBToS3Trigger
+      ScheduleExpression: cron(0 19 * * ? *)  # 19:00 UTC diariamente
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DynamoDBToS3Lambda.Arn
+          Id: DynamoDBToS3LambdaTarget
+
+  # Permiso para que EventBridge invoque la Lambda
+  DynamoDBToS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DynamoDBToS3Lambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DynamoDBToS3EventRule.Arn
+
+Outputs:
+  LambdaFunctionName:
+    Description: Nombre de la función Lambda creada
+    Value: !Ref DynamoDBToS3Lambda
+
+  S3BucketName:
+    Description: Nombre del bucket S3 creado
+    Value: !Ref WeatherDataBucket
